@@ -1,7 +1,7 @@
 import os, re
 from datetime import datetime
-from modules import plex, util, overlay
-from modules.builder import CollectionBuilder
+from modules import plex, util
+from modules.builder import CollectionBuilder, overlay_config
 from modules.util import Failed, FilterFailed, NotScheduled, LimitReached
 from num2words import num2words
 from plexapi.exceptions import BadRequest
@@ -9,6 +9,50 @@ from plexapi.video import Season, Episode
 from PIL import Image, ImageFilter
 
 logger = util.logger
+
+_RATING_SOURCES = [
+    "tmdb_rating", "imdb_rating", "trakt_user_rating", "omdb_rating", "mdb_rating", "mdb_average_rating",
+    "mdb_imdb_rating", "mdb_metacritic_rating", "mdb_metacriticuser_rating", "mdb_trakt_rating", "mdb_tomatoes_rating",
+    "mdb_tomatoesaudience_rating", "mdb_tmdb_rating", "mdb_letterboxd_rating", "mdb_myanimelist_rating",
+    "anidb_rating", "anidb_average_rating", "anidb_score_rating", "mal_rating"
+]
+_FLOAT_VARS = ["audience_rating", "critic_rating", "user_rating"] + _RATING_SOURCES
+_INT_VARS = ["runtime", "season_number", "episode_number", "episode_count", "versions"]
+_DATE_VARS = ["originally_available"]
+_TYPES_FOR_VAR = {
+    "movie_show_season_episode_artist_album": ["runtime", "user_rating", "title"],
+    "movie_show_episode_album": ["critic_rating", "originally_available"],
+    "movie_show_season_episode": ["tmdb_rating"],
+    "movie_show_episode": ["audience_rating", "content_rating", "tmdb_rating", "imdb_rating"],
+    "movie_show": [
+        "original_title", "trakt_user_rating", "omdb_rating", "mdb_rating", "mdb_average_rating", "mdb_imdb_rating",
+        "mdb_metacritic_rating", "mdb_metacriticuser_rating", "mdb_trakt_rating", "mdb_tomatoes_rating",
+        "mdb_tomatoesaudience_rating", "mdb_tmdb_rating", "mdb_letterboxd_rating", "mdb_myanimelist_rating",
+        "anidb_rating", "anidb_average_rating", "anidb_score_rating", "mal_rating"
+    ],
+    "movie_episode": ["versions", "bitrate"],
+    "season_episode": ["show_title", "season_number"],
+    "show_season": ["episode_count"],
+    "movie": ["edition"],
+    "episode": ["season_title", "episode_number"]
+}
+_VAR_MODS = {
+    "bitrate": ["", "H", "L"],
+    "originally_available": ["", "["],
+    "runtime": ["", "H", "M"],
+}
+for mod in _FLOAT_VARS:
+    _VAR_MODS[mod] = ["", "%", "#", "/"]
+for mod in ["title", "content_rating", "original_title", "edition", "show_title", "season_title"]:
+    _VAR_MODS[mod] = ["", "U", "L", "P"]
+for mod in ["season_number", "episode_number", "episode_count", "versions"]:
+    _VAR_MODS[mod] = ["", "W", "WU", "WL", "0", "00"]
+
+_SINGLE_MODS = list(set([mod for mods in _VAR_MODS.values() for mod in mods if len(mod) == 1]))
+_DOUBLE_MODS = list(set([mod for mods in _VAR_MODS.values() for mod in mods if len(mod) == 2]))
+_VARS_BY_TYPE = {}
+for key in ["movie", "show", "season", "episode", "artist", "album"]:
+    _VARS_BY_TYPE[key] = [f"{item}{mod}" for type, var in _TYPES_FOR_VAR.items() for item in var for mod in _VAR_MODS[item] if key in type]
 
 class Overlays:
     def __init__(self, config, library):
@@ -136,11 +180,11 @@ class Overlays:
                                     real_value = getattr(item, actual)
                                     if cache_value is None or real_value is None:
                                         continue
-                                    if cache_key in overlay.float_vars:
+                                    if cache_key in _FLOAT_VARS:
                                         cache_value = float(cache_value)
-                                    if cache_key in overlay.int_vars:
+                                    if cache_key in _INT_VARS:
                                         cache_value = int(cache_value)
-                                    if cache_key in overlay.date_vars:
+                                    if cache_key in _DATE_VARS:
                                         real_value = real_value.strftime("%Y-%m-%d")
                                     if real_value != cache_value:
                                         overlay_change = f"Special Text Changed from {cache_value} to {real_value}"
@@ -207,7 +251,7 @@ class Overlays:
                                 logger.trace("  Overlay Reason: New image detected")
                             elif not self.library.reapply_overlays and overlay_change:
                                 logger.trace(f"  Overlay Reason: Overlay changed {overlay_change}")
-                            canvas_width, canvas_height = overlay.get_canvas_size(item)
+                            canvas_width, canvas_height = overlay_config.get_canvas_size(item)
                             with Image.open(poster.location if poster else has_original) as new_poster:
                                 exif_tags = new_poster.getexif()
                                 exif_tags[0x04bc] = "overlay"
@@ -218,14 +262,14 @@ class Overlays:
 
                                 def get_text(text_overlay):
                                     full_text = text_overlay.name[5:-1]
-                                    for format_var in overlay.vars_by_type[text_overlay.level]:
+                                    for format_var in _VARS_BY_TYPE[text_overlay.level]:
                                         if f"<<{format_var}" in full_text and format_var == "originally_available[":
                                             mod = re.search("<<originally_available\\[(.+)]>>", full_text).group(1)
                                             format_var = "originally_available"
-                                        elif f"<<{format_var}>>" in full_text and format_var.endswith(tuple(m for m in overlay.double_mods)):
+                                        elif f"<<{format_var}>>" in full_text and format_var.endswith(tuple(m for m in _DOUBLE_MODS)):
                                             mod = format_var[-2:]
                                             format_var = format_var[:-2]
-                                        elif f"<<{format_var}>>" in full_text and format_var.endswith(tuple(m for m in overlay.single_mods)):
+                                        elif f"<<{format_var}>>" in full_text and format_var.endswith(tuple(m for m in _SINGLE_MODS)):
                                             mod = format_var[-1]
                                             format_var = format_var[:-1]
                                         elif f"<<{format_var}>>" in full_text:
@@ -250,7 +294,7 @@ class Overlays:
                                                     actual_value = current
                                                 elif mod == "L" and current < actual_value:
                                                     actual_value = current
-                                        elif format_var in overlay.rating_sources:
+                                        elif format_var in _RATING_SOURCES:
                                             found_rating = None
                                             try:
                                                 item_to_id = item.show() if isinstance(item, (Season, Episode)) else item
@@ -395,7 +439,7 @@ class Overlays:
                                             if format_var == "versions":
                                                 actual_value = len(actual_value)
                                         if self.config.Cache:
-                                            cache_store = actual_value.strftime("%Y-%m-%d") if format_var in overlay.date_vars else actual_value
+                                            cache_store = actual_value.strftime("%Y-%m-%d") if format_var in _DATE_VARS else actual_value
                                             self.config.Cache.update_overlay_special_text(item.ratingKey, format_var, cache_store)
                                         sub_value = None
                                         if format_var == "originally_available":
@@ -434,7 +478,7 @@ class Overlays:
                                             final_value = str(actual_value).lower()
                                         elif mod == "P":
                                             final_value = str(actual_value).title()
-                                        elif format_var in overlay.rating_sources:
+                                        elif format_var in _RATING_SOURCES:
                                             final_value = f"{float(actual_value):.1f}"
                                         else:
                                             final_value = actual_value
@@ -553,7 +597,7 @@ class Overlays:
                     prop_name = builder.overlay.mapping_name
                     properties[prop_name] = builder.overlay
 
-                    builder.display_filters()
+                    builder.log_filters()
 
                     for method, value in builder.builders:
                         logger.debug("")
